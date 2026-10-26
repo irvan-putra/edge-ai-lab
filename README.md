@@ -38,12 +38,15 @@ recording, or uploads. Models can be deleted from app storage.
 - yolov8n.onnx / yolov8n-pose.onnx exported from official Ultralytics .pt
   weights and smoke-tested in ONNX Runtime: output shapes [1,84,8400] /
   [1,56,8400].
-- Whisper pipeline validated end-to-end against the real quantized ONNX
-  models with the exact same algorithm the Java code implements
-  (log-mel -> encoder -> two-stage decoder with KV cache, greedy decode):
-  correctly transcribes the whisper JFK test clip. The Java log-mel matches
-  the numpy reference to 2.3e-6 (filters are whisper's own mel_filters.npz
-  values, bundled as an asset).
+- Whisper pipeline: the ACTUAL COMPILED Java classes (MelSpectrogram,
+  WhisperTokenizer, WhisperEngine from this repo) were run on the desktop
+  JVM against the real quantized onnx-community models and correctly
+  transcribe whisper's JFK test clip ("And so my fellow Americans ask not
+  what your country can do for you..."). The hand-written log-mel/FFT
+  matches the numpy reference to 2.3e-6; the mel filterbank is whisper's
+  own mel_filters.npz values, bundled as an asset.
+- Not covered by host testing: Android UI behavior, camera/mic pipelines,
+  Sensor Lab output, and on-device speed. Those need the phone.
 
 ## Build
 
