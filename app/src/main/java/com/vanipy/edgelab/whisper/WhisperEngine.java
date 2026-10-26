@@ -143,65 +143,64 @@ public class WhisperEngine implements AutoCloseable {
 
     private long decodeInternal(List<Integer> prefix, float[] hiddenFlat, Result result) throws Exception {
         List<Integer> generated = new ArrayList<>();
-        List<OnnxTensor> owned = new ArrayList<>();
-        Map<String, OnnxTensor> encPast = new HashMap<>();
-        Map<String, OnnxTensor> decPast = new HashMap<>();
+        OrtSession.Result firstResult = null;
+        OrtSession.Result prevResult = null;
         try {
             long[] prefixArr = new long[prefix.size()];
             for (int i = 0; i < prefix.size(); i++) prefixArr[i] = prefix.get(i);
 
             // First pass: decoder without past, over the full prefix.
+            // Results stay OPEN: present.* tensors reused as KV cache are owned by them.
             OnnxTensor ids = OnnxTensor.createTensor(env, LongBuffer.wrap(prefixArr), new long[]{1, prefixArr.length});
             OnnxTensor hidden = OnnxTensor.createTensor(env, FloatBuffer.wrap(hiddenFlat), new long[]{1, 1500, 384});
-            owned.add(ids); owned.add(hidden);
             Map<String, OnnxTensor> inputs = new HashMap<>();
             inputs.put("input_ids", ids);
             inputs.put("encoder_hidden_states", hidden);
+            firstResult = decoderInit.run(inputs);
+            prevResult = firstResult;
+            ids.close();
+            hidden.close();
 
-            int next;
-            try (OrtSession.Result dr = decoderInit.run(inputs)) {
-                next = argmaxLast(dr, true);
-                splitPresent(dr, encPast, decPast);
-            } finally {
-                for (OnnxTensor t : owned) { try { t.close(); } catch (Exception ignored) {} }
-                owned.clear();
-            }
+            int next = argmaxLast(firstResult, true);
+            Map<String, OnnxTensor> encPast = new HashMap<>();
+            Map<String, OnnxTensor> decPast = new HashMap<>();
+            splitPresent(firstResult, encPast, decPast);
 
             // Subsequent passes: decoder with past, one token at a time.
             // Encoder cross-KV is fixed after the first pass; only decoder self-KV advances.
             while (next != eot && generated.size() < MAX_TOKENS) {
                 generated.add(next);
                 Map<String, OnnxTensor> step = new HashMap<>();
-                for (Map.Entry<String, OnnxTensor> e : decPast.entrySet()) {
-                    step.put(e.getKey(), e.getValue());
-                    owned.add(e.getValue());
-                }
-                for (Map.Entry<String, OnnxTensor> e : encPast.entrySet()) {
-                    step.put(e.getKey(), e.getValue());
-                    owned.add(e.getValue());
-                }
+                step.putAll(decPast);
+                step.putAll(encPast);
                 long[] one = {next};
                 OnnxTensor ids1 = OnnxTensor.createTensor(env, LongBuffer.wrap(one), new long[]{1, 1});
-                owned.add(ids1);
                 step.put("input_ids", ids1);
+                OrtSession.Result stepResult = decoderPast.run(step);
+                ids1.close();
+
+                next = argmaxLast(stepResult, false);
                 Map<String, OnnxTensor> newDecPast = new HashMap<>();
-                try (OrtSession.Result dr = decoderPast.run(step)) {
-                    next = argmaxLast(dr, false);
-                    for (Map.Entry<String, ? extends ai.onnxruntime.OnnxValue> e : dr) {
-                        if (e.getKey().startsWith("present.") && e.getKey().contains(".decoder.")) {
-                            newDecPast.put(e.getKey().replace("present.", "past_key_values."), (OnnxTensor) e.getValue());
-                        }
+                for (Map.Entry<String, ? extends ai.onnxruntime.OnnxValue> e : stepResult) {
+                    if (e.getKey().startsWith("present.") && e.getKey().contains(".decoder.")) {
+                        newDecPast.put(e.getKey().replace("present.", "past_key_values."), (OnnxTensor) e.getValue());
                     }
-                } finally {
-                    for (OnnxTensor t : owned) { try { t.close(); } catch (Exception ignored) {} }
-                    owned.clear();
                 }
+                // The new run has consumed the previous result's tensors; it can be closed now.
+                // firstResult owns encPast for the whole loop, so it is closed only at the end.
+                if (prevResult != firstResult) {
+                    try { prevResult.close(); } catch (Exception ignored) {}
+                }
+                prevResult = stepResult;
                 decPast = newDecPast;
             }
         } finally {
-            for (OnnxTensor t : owned) { try { t.close(); } catch (Exception ignored) {} }
-            for (OnnxTensor t : encPast.values()) { try { t.close(); } catch (Exception ignored) {} }
-            for (OnnxTensor t : decPast.values()) { try { t.close(); } catch (Exception ignored) {} }
+            if (prevResult != null && prevResult != firstResult) {
+                try { prevResult.close(); } catch (Exception ignored) {}
+            }
+            if (firstResult != null) {
+                try { firstResult.close(); } catch (Exception ignored) {} finally { prevResult = null; }
+            }
         }
 
         result.text = tokenizer.decode(generated).trim();
